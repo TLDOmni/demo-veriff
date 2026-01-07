@@ -4,34 +4,54 @@ from flask import Flask, request, jsonify, redirect
 
 app = Flask(__name__)
 
-# --- CONFIGURAÇÕES GERAIS ---
+# --- CONFIGURAÇÕES ---
 VERIFF_API_URL = "https://stationapi.veriff.com/v1/sessions"
 VERIFF_API_KEY = os.getenv("VERIFF_API_KEY")
 VERIFF_SHARED_SECRET = os.getenv("VERIFF_SHARED_SECRET")
 
-# --- CONFIGURAÇÕES INFOBIP ---
+# Configurações Infobip
 INFOBIP_BASE_URL = os.getenv("INFOBIP_BASE_URL") 
 INFOBIP_API_KEY = os.getenv("INFOBIP_API_KEY")
 INFOBIP_SENDER = os.getenv("INFOBIP_SENDER") 
 
-# [NOVO] URL do Gatilho de Webhook do Infobip Answers
-# Você vai gerar isso criando um fluxo que começa com "Webhook" no Infobip
-INFOBIP_FLOW_URL = os.getenv("INFOBIP_FLOW_URL") 
+# URL Base para o Webhook do Bot (Opção 1.1)
+INFOBIP_WEBHOOK_BASE = "https://api2.infobip.com/bots/webhook"
 
-# URL DO SEU BOT (Para redirecionar o usuario no final da UI da Veriff)
-WHATSAPP_LINK = f"https://wa.me/{INFOBIP_SENDER}" if INFOBIP_SENDER else "https://wa.me/"
-
-# SUA URL NO RENDER (Callback)
+# URL do seu Middleware no Render
 MY_RENDER_URL = "https://demo-veriff.onrender.com"
 
-# --- FUNÇÕES AUXILIARES ---
+# Link para voltar ao WhatsApp
+WHATSAPP_LINK = f"https://wa.me/{INFOBIP_SENDER}" if INFOBIP_SENDER else "https://wa.me/"
 
+# --- FUNÇÃO: ACIONAR O CHATBOT (WEBHOOK 1.1) ---
+def trigger_infobip_webhook(session_id, status, reason=""):
+    if not session_id:
+        print("ERRO: SessionID não encontrado. Não é possível chamar o webhook.")
+        return False
+
+    webhook_target_url = f"{INFOBIP_WEBHOOK_BASE}/{session_id}"
+    print(f"Acionando Webhook Infobip para Sessão {session_id} - Status: {status}")
+    
+    payload = {
+        "veriff_status": status,
+        "veriff_reason": reason
+    }
+    
+    try:
+        response = requests.post(webhook_target_url, json=payload)
+        if response.status_code < 300:
+            print("Sucesso! O Chatbot recebeu o sinal.")
+            return True
+        else:
+            print(f"Erro Infobip Webhook ({response.status_code}): {response.text}")
+            return False
+    except Exception as e:
+        print(f"Exceção ao chamar Infobip: {e}")
+        return False
+
+# --- FUNÇÃO: FALLBACK MENSAGEM ---
 def send_whatsapp_message(to_number, text):
-    """Envia mensagem de texto simples (Fallback)"""
-    if not to_number or "{" in to_number:
-        print(f"ERRO: Número inválido para envio: {to_number}")
-        return
-
+    if not to_number: return
     url = f"{INFOBIP_BASE_URL}/whatsapp/1/message/text"
     headers = {
         "Authorization": f"App {INFOBIP_API_KEY}",
@@ -44,57 +64,30 @@ def send_whatsapp_message(to_number, text):
     }
     try:
         requests.post(url, json=payload, headers=headers)
-    except Exception as e:
-        print(f"Erro fallback WhatsApp: {e}")
-
-def trigger_infobip_flow(to_number, status, reason=""):
-    """
-    [NOVA FUNÇÃO]
-    Chama o Webhook do Infobip Answers para continuar o fluxo do bot.
-    Envia JSON: { "phone": "...", "status": "approved", "reason": "..." }
-    """
-    if not INFOBIP_FLOW_URL:
-        print("INFOBIP_FLOW_URL não configurada. Usando envio de mensagem simples.")
-        return False
-
-    print(f"Acionando fluxo do Chatbot para {to_number} com status {status}...")
-    
-    payload = {
-        "phone": to_number,
-        "veriff_status": status, # approved / declined / resubmission_requested
-        "veriff_reason": reason
-    }
-    
-    # Dependendo da configuração do seu Webhook no Infobip, 
-    # as vezes é necessário passar dados dentro de um objeto 'data' ou direto no root.
-    # Vamos enviar direto no root (padrão mais comum).
-    
-    try:
-        response = requests.post(INFOBIP_FLOW_URL, json=payload)
-        print(f"Resposta do Infobip Flow: {response.status_code} - {response.text}")
-        return response.status_code in [200, 201, 202]
-    except Exception as e:
-        print(f"Erro ao acionar fluxo Infobip: {e}")
-        return False
+    except:
+        pass
 
 # --- ENDPOINTS ---
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Middleware Veriff-Infobip v2 (Flow Trigger) Online.", 200
+    return "Middleware v3.1 (Key Updated: link_veriff) Online", 200
 
 @app.route('/start-verification', methods=['POST'])
 def start_verification():
     data = request.json
     
     phone = data.get('phoneNumber')
+    session_id = data.get('sessionId')
     first_name = data.get('first_name', 'Usuario')
     last_name = data.get('last_name', '') 
     
-    print(f"Iniciando verificação para: {first_name} - Tel: {phone}")
+    print(f"Iniciando: {first_name}, Tel: {phone}, Session: {session_id}")
 
-    if not phone or "{" in phone:
-        print("ALERTA: O número de telefone parece inválido (variável não processada).")
+    if not session_id:
+        return jsonify({"error": "sessionId is required from Infobip"}), 400
+
+    combined_data = f"{phone}::{session_id}"
 
     veriff_payload = {
         "verification": {
@@ -103,7 +96,7 @@ def start_verification():
                 "firstName": first_name,
                 "lastName": last_name
             },
-            "vendorData": phone, 
+            "vendorData": combined_data, 
             "timestamp": "2024-01-01T00:00:00.000Z" 
         }
     }
@@ -116,44 +109,52 @@ def start_verification():
     try:
         response = requests.post(VERIFF_API_URL, json=veriff_payload, headers=headers)
         if response.status_code == 201:
-            return jsonify({"veriff_link": response.json()['verification']['url']}), 200
+            url = response.json()['verification']['url']
+            
+            # --- ALTERAÇÃO AQUI: Chave agora é link_veriff ---
+            return jsonify({"link_veriff": url}), 200
+            
         else:
-            print(f"Erro Veriff: {response.text}")
             return jsonify({"error": "Erro Veriff"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/webhook/veriff', methods=['POST', 'GET'])
 def veriff_webhook():
-    
-    # 1. Usuário voltando do navegador (Redirecionamento)
     if request.method == 'GET':
         return redirect(WHATSAPP_LINK, code=302)
 
-    # 2. Webhook de Decisão da Veriff
     data = request.json
     action = data.get('action')
     
     if action != 'decision':
         return jsonify({"status": "ignored"}), 200
 
-    vendor_data = data.get('verification', {}).get('vendorData') # Telefone
-    status = data.get('verification', {}).get('status')
-    reason = data.get('verification', {}).get('reason', '')
+    verification = data.get('verification', {})
+    status = verification.get('status')
+    reason = verification.get('reason', '')
+    vendor_data_raw = verification.get('vendorData', '')
 
-    print(f"Decisão Veriff recebida: {status} para {vendor_data}")
+    phone = ""
+    session_id = ""
+    
+    if "::" in vendor_data_raw:
+        try:
+            phone, session_id = vendor_data_raw.split("::")
+        except:
+            print("Erro parse vendorData")
+    else:
+        phone = vendor_data_raw
 
-    # TENTA acionar o fluxo do Chatbot (Método Preferencial)
-    flow_triggered = trigger_infobip_flow(vendor_data, status, reason)
+    print(f"Decisão: {status} | User: {phone} | Session: {session_id}")
 
-    # Se não tiver URL de fluxo configurada, ou se falhar, usa o método antigo (Mensagem Texto)
-    if not flow_triggered:
-        if status == 'approved':
-            send_whatsapp_message(vendor_data, "✅ Identidade validada com sucesso! (Mensagem via Middleware)")
-        elif status == 'declined':
-            send_whatsapp_message(vendor_data, f"❌ Falha na validação. Motivo: {reason}")
-        elif status == 'resubmission_requested':
-            send_whatsapp_message(vendor_data, "⚠️ A imagem não ficou nítida. Tente novamente.")
+    success = False
+    if session_id:
+        success = trigger_infobip_webhook(session_id, status, reason)
+    
+    if not success and phone:
+        msg = "✅ Identidade validada!" if status == 'approved' else "❌ Falha na validação."
+        send_whatsapp_message(phone, msg)
 
     return jsonify({"status": "received"}), 200
 
