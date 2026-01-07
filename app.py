@@ -9,49 +9,24 @@ VERIFF_API_URL = "https://stationapi.veriff.com/v1/sessions"
 VERIFF_API_KEY = os.getenv("VERIFF_API_KEY")
 VERIFF_SHARED_SECRET = os.getenv("VERIFF_SHARED_SECRET")
 
-# Configurações Infobip
 INFOBIP_BASE_URL = os.getenv("INFOBIP_BASE_URL") 
 INFOBIP_API_KEY = os.getenv("INFOBIP_API_KEY")
 INFOBIP_SENDER = os.getenv("INFOBIP_SENDER") 
 
-# URL Base para o Webhook do Bot (Opção 1.1)
-INFOBIP_WEBHOOK_BASE = "https://api2.infobip.com/bots/webhook"
-
-# URL do seu Middleware no Render
-MY_RENDER_URL = "https://demo-veriff.onrender.com"
-
-# Link para voltar ao WhatsApp
+# URL DO SEU BOT (Para redirecionar o usuario no final)
+# Se o sender for 447860099299, a URL será https://wa.me/447860099299
 WHATSAPP_LINK = f"https://wa.me/{INFOBIP_SENDER}" if INFOBIP_SENDER else "https://wa.me/"
 
-# --- FUNÇÃO: ACIONAR O CHATBOT (WEBHOOK 1.1) ---
-def trigger_infobip_webhook(session_id, status, reason=""):
-    if not session_id:
-        print("ERRO: SessionID não encontrado. Não é possível chamar o webhook.")
-        return False
+# SUA URL NO RENDER
+MY_RENDER_URL = "https://demo-veriff.onrender.com"
 
-    webhook_target_url = f"{INFOBIP_WEBHOOK_BASE}/{session_id}"
-    print(f"Acionando Webhook Infobip para Sessão {session_id} - Status: {status}")
-    
-    payload = {
-        "veriff_status": status,
-        "veriff_reason": reason
-    }
-    
-    try:
-        response = requests.post(webhook_target_url, json=payload)
-        if response.status_code < 300:
-            print("Sucesso! O Chatbot recebeu o sinal.")
-            return True
-        else:
-            print(f"Erro Infobip Webhook ({response.status_code}): {response.text}")
-            return False
-    except Exception as e:
-        print(f"Exceção ao chamar Infobip: {e}")
-        return False
-
-# --- FUNÇÃO: FALLBACK MENSAGEM ---
+# --- FUNÇÃO ENVIO WHATSAPP ---
 def send_whatsapp_message(to_number, text):
-    if not to_number: return
+    # Proteção contra variaveis não preenchidas
+    if "{" in to_number or "}" in to_number:
+        print(f"ERRO CRÍTICO: Tentativa de envio para número inválido: {to_number}. Verifique o Infobip Answers.")
+        return
+
     url = f"{INFOBIP_BASE_URL}/whatsapp/1/message/text"
     headers = {
         "Authorization": f"App {INFOBIP_API_KEY}",
@@ -63,31 +38,32 @@ def send_whatsapp_message(to_number, text):
         "content": {"text": text}
     }
     try:
-        requests.post(url, json=payload, headers=headers)
-    except:
-        pass
-
-# --- ENDPOINTS ---
+        response = requests.post(url, json=payload, headers=headers)
+        # Log detalhado em caso de erro da Infobip
+        if response.status_code != 200:
+            print(f"Erro Infobip {response.status_code}: {response.text}")
+        else:
+            print(f"Mensagem enviada para {to_number}: {text}")
+    except Exception as e:
+        print(f"Erro de conexão Infobip: {e}")
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Middleware v3.1 (Key Updated: link_veriff) Online", 200
+    return "Middleware Veriff-Infobip Operacional.", 200
 
 @app.route('/start-verification', methods=['POST'])
 def start_verification():
     data = request.json
     
     phone = data.get('phoneNumber')
-    session_id = data.get('sessionId')
     first_name = data.get('first_name', 'Usuario')
     last_name = data.get('last_name', '') 
     
-    print(f"Iniciando: {first_name}, Tel: {phone}, Session: {session_id}")
+    print(f"Iniciando verificação para: {first_name} - Tel: {phone}")
 
-    if not session_id:
-        return jsonify({"error": "sessionId is required from Infobip"}), 400
-
-    combined_data = f"{phone}::{session_id}"
+    # Validação simples para evitar erro no log
+    if not phone or "{" in phone:
+        print("ALERTA: O número de telefone parece ser uma variável não processada do Infobip.")
 
     veriff_payload = {
         "verification": {
@@ -96,7 +72,7 @@ def start_verification():
                 "firstName": first_name,
                 "lastName": last_name
             },
-            "vendorData": combined_data, 
+            "vendorData": phone, 
             "timestamp": "2024-01-01T00:00:00.000Z" 
         }
     }
@@ -109,52 +85,42 @@ def start_verification():
     try:
         response = requests.post(VERIFF_API_URL, json=veriff_payload, headers=headers)
         if response.status_code == 201:
-            url = response.json()['verification']['url']
-            
-            # --- ALTERAÇÃO AQUI: Chave agora é link_veriff ---
-            return jsonify({"link_veriff": url}), 200
-            
+            return jsonify({"veriff_link": response.json()['verification']['url']}), 200
         else:
+            print(f"Erro Veriff: {response.text}")
             return jsonify({"error": "Erro Veriff"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# --- CORREÇÃO PRINCIPAL AQUI ---
+# Agora aceitamos GET (Navegador do usuário) e POST (Servidor da Veriff)
 @app.route('/webhook/veriff', methods=['POST', 'GET'])
 def veriff_webhook():
+    
+    # 1. Se for GET, é o usuário no navegador voltando da Veriff
     if request.method == 'GET':
+        # Redireciona ele de volta para a conversa no WhatsApp
         return redirect(WHATSAPP_LINK, code=302)
 
+    # 2. Se for POST, é o servidor da Veriff enviando o status
     data = request.json
     action = data.get('action')
     
     if action != 'decision':
         return jsonify({"status": "ignored"}), 200
 
-    verification = data.get('verification', {})
-    status = verification.get('status')
-    reason = verification.get('reason', '')
-    vendor_data_raw = verification.get('vendorData', '')
+    vendor_data = data.get('verification', {}).get('vendorData')
+    status = data.get('verification', {}).get('status')
+    reason = data.get('verification', {}).get('reason', '')
 
-    phone = ""
-    session_id = ""
-    
-    if "::" in vendor_data_raw:
-        try:
-            phone, session_id = vendor_data_raw.split("::")
-        except:
-            print("Erro parse vendorData")
-    else:
-        phone = vendor_data_raw
+    print(f"Webhook Decision: {status} para User: {vendor_data}")
 
-    print(f"Decisão: {status} | User: {phone} | Session: {session_id}")
-
-    success = False
-    if session_id:
-        success = trigger_infobip_webhook(session_id, status, reason)
-    
-    if not success and phone:
-        msg = "✅ Identidade validada!" if status == 'approved' else "❌ Falha na validação."
-        send_whatsapp_message(phone, msg)
+    if status == 'approved':
+        send_whatsapp_message(vendor_data, "✅ Identidade validada com sucesso! Aguarde um momento.")
+    elif status == 'declined':
+        send_whatsapp_message(vendor_data, f"❌ Falha na validação. Motivo: {reason}")
+    elif status == 'resubmission_requested':
+        send_whatsapp_message(vendor_data, "⚠️ Imagem ruim. Tente novamente.")
 
     return jsonify({"status": "received"}), 200
 
