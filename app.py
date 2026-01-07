@@ -4,27 +4,32 @@ from flask import Flask, request, jsonify, redirect
 
 app = Flask(__name__)
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES GERAIS ---
 VERIFF_API_URL = "https://stationapi.veriff.com/v1/sessions"
 VERIFF_API_KEY = os.getenv("VERIFF_API_KEY")
 VERIFF_SHARED_SECRET = os.getenv("VERIFF_SHARED_SECRET")
 
+# --- CONFIGURAÇÕES INFOBIP ---
 INFOBIP_BASE_URL = os.getenv("INFOBIP_BASE_URL") 
 INFOBIP_API_KEY = os.getenv("INFOBIP_API_KEY")
 INFOBIP_SENDER = os.getenv("INFOBIP_SENDER") 
 
-# URL DO SEU BOT (Para redirecionar o usuario no final)
-# Se o sender for 447860099299, a URL será https://wa.me/447860099299
+# [NOVO] URL do Gatilho de Webhook do Infobip Answers
+# Você vai gerar isso criando um fluxo que começa com "Webhook" no Infobip
+INFOBIP_FLOW_URL = os.getenv("INFOBIP_FLOW_URL") 
+
+# URL DO SEU BOT (Para redirecionar o usuario no final da UI da Veriff)
 WHATSAPP_LINK = f"https://wa.me/{INFOBIP_SENDER}" if INFOBIP_SENDER else "https://wa.me/"
 
-# SUA URL NO RENDER
+# SUA URL NO RENDER (Callback)
 MY_RENDER_URL = "https://demo-veriff.onrender.com"
 
-# --- FUNÇÃO ENVIO WHATSAPP ---
+# --- FUNÇÕES AUXILIARES ---
+
 def send_whatsapp_message(to_number, text):
-    # Proteção contra variaveis não preenchidas
-    if "{" in to_number or "}" in to_number:
-        print(f"ERRO CRÍTICO: Tentativa de envio para número inválido: {to_number}. Verifique o Infobip Answers.")
+    """Envia mensagem de texto simples (Fallback)"""
+    if not to_number or "{" in to_number:
+        print(f"ERRO: Número inválido para envio: {to_number}")
         return
 
     url = f"{INFOBIP_BASE_URL}/whatsapp/1/message/text"
@@ -38,18 +43,45 @@ def send_whatsapp_message(to_number, text):
         "content": {"text": text}
     }
     try:
-        response = requests.post(url, json=payload, headers=headers)
-        # Log detalhado em caso de erro da Infobip
-        if response.status_code != 200:
-            print(f"Erro Infobip {response.status_code}: {response.text}")
-        else:
-            print(f"Mensagem enviada para {to_number}: {text}")
+        requests.post(url, json=payload, headers=headers)
     except Exception as e:
-        print(f"Erro de conexão Infobip: {e}")
+        print(f"Erro fallback WhatsApp: {e}")
+
+def trigger_infobip_flow(to_number, status, reason=""):
+    """
+    [NOVA FUNÇÃO]
+    Chama o Webhook do Infobip Answers para continuar o fluxo do bot.
+    Envia JSON: { "phone": "...", "status": "approved", "reason": "..." }
+    """
+    if not INFOBIP_FLOW_URL:
+        print("INFOBIP_FLOW_URL não configurada. Usando envio de mensagem simples.")
+        return False
+
+    print(f"Acionando fluxo do Chatbot para {to_number} com status {status}...")
+    
+    payload = {
+        "phone": to_number,
+        "veriff_status": status, # approved / declined / resubmission_requested
+        "veriff_reason": reason
+    }
+    
+    # Dependendo da configuração do seu Webhook no Infobip, 
+    # as vezes é necessário passar dados dentro de um objeto 'data' ou direto no root.
+    # Vamos enviar direto no root (padrão mais comum).
+    
+    try:
+        response = requests.post(INFOBIP_FLOW_URL, json=payload)
+        print(f"Resposta do Infobip Flow: {response.status_code} - {response.text}")
+        return response.status_code in [200, 201, 202]
+    except Exception as e:
+        print(f"Erro ao acionar fluxo Infobip: {e}")
+        return False
+
+# --- ENDPOINTS ---
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Middleware Veriff-Infobip Operacional.", 200
+    return "Middleware Veriff-Infobip v2 (Flow Trigger) Online.", 200
 
 @app.route('/start-verification', methods=['POST'])
 def start_verification():
@@ -61,9 +93,8 @@ def start_verification():
     
     print(f"Iniciando verificação para: {first_name} - Tel: {phone}")
 
-    # Validação simples para evitar erro no log
     if not phone or "{" in phone:
-        print("ALERTA: O número de telefone parece ser uma variável não processada do Infobip.")
+        print("ALERTA: O número de telefone parece inválido (variável não processada).")
 
     veriff_payload = {
         "verification": {
@@ -92,35 +123,37 @@ def start_verification():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- CORREÇÃO PRINCIPAL AQUI ---
-# Agora aceitamos GET (Navegador do usuário) e POST (Servidor da Veriff)
 @app.route('/webhook/veriff', methods=['POST', 'GET'])
 def veriff_webhook():
     
-    # 1. Se for GET, é o usuário no navegador voltando da Veriff
+    # 1. Usuário voltando do navegador (Redirecionamento)
     if request.method == 'GET':
-        # Redireciona ele de volta para a conversa no WhatsApp
         return redirect(WHATSAPP_LINK, code=302)
 
-    # 2. Se for POST, é o servidor da Veriff enviando o status
+    # 2. Webhook de Decisão da Veriff
     data = request.json
     action = data.get('action')
     
     if action != 'decision':
         return jsonify({"status": "ignored"}), 200
 
-    vendor_data = data.get('verification', {}).get('vendorData')
+    vendor_data = data.get('verification', {}).get('vendorData') # Telefone
     status = data.get('verification', {}).get('status')
     reason = data.get('verification', {}).get('reason', '')
 
-    print(f"Webhook Decision: {status} para User: {vendor_data}")
+    print(f"Decisão Veriff recebida: {status} para {vendor_data}")
 
-    if status == 'approved':
-        send_whatsapp_message(vendor_data, "✅ Identidade validada com sucesso! Aguarde um momento.")
-    elif status == 'declined':
-        send_whatsapp_message(vendor_data, f"❌ Falha na validação. Motivo: {reason}")
-    elif status == 'resubmission_requested':
-        send_whatsapp_message(vendor_data, "⚠️ Imagem ruim. Tente novamente.")
+    # TENTA acionar o fluxo do Chatbot (Método Preferencial)
+    flow_triggered = trigger_infobip_flow(vendor_data, status, reason)
+
+    # Se não tiver URL de fluxo configurada, ou se falhar, usa o método antigo (Mensagem Texto)
+    if not flow_triggered:
+        if status == 'approved':
+            send_whatsapp_message(vendor_data, "✅ Identidade validada com sucesso! (Mensagem via Middleware)")
+        elif status == 'declined':
+            send_whatsapp_message(vendor_data, f"❌ Falha na validação. Motivo: {reason}")
+        elif status == 'resubmission_requested':
+            send_whatsapp_message(vendor_data, "⚠️ A imagem não ficou nítida. Tente novamente.")
 
     return jsonify({"status": "received"}), 200
 
