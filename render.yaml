@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: veriff-infobip-middleware
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: VERIFF_API_KEY
+        sync: false
+      - key: VERIFF_SHARED_SECRET
+        sync: false
+      - key: INFOBIP_BASE_URL
+        sync: false
+      - key: INFOBIP_API_KEY
+        sync: false
+      - key: INFOBIP_SENDER
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
